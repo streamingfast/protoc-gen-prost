@@ -1,10 +1,11 @@
-use crate::resolver::Resolver;
-use crate::util;
 use prost_build::{Module, Service};
-use prost_types::compiler::code_generator_response::File;
-use prost_types::{FileDescriptorProto, ServiceDescriptorProto};
+use prost_types::{
+    compiler::code_generator_response::File, FileDescriptorProto, ServiceDescriptorProto,
+};
 use protoc_gen_prost::{Generator, ModuleRequest, ModuleRequestSet, Result};
 use tonic_build::Attributes;
+
+use crate::{resolver::Resolver, util};
 
 pub(crate) struct TonicGenerator {
     pub(crate) resolver: Resolver,
@@ -13,6 +14,7 @@ pub(crate) struct TonicGenerator {
     pub(crate) server_attributes: Attributes,
     pub(crate) client_attributes: Attributes,
     pub(crate) emit_package: bool,
+    pub(crate) insert_include: bool,
 }
 
 impl Generator for TonicGenerator {
@@ -27,7 +29,7 @@ impl Generator for TonicGenerator {
 }
 
 impl TonicGenerator {
-    fn handle_module_request(&self, module: &Module, request: &ModuleRequest) -> Option<[File; 2]> {
+    fn handle_module_request(&self, module: &Module, request: &ModuleRequest) -> Option<Vec<File>> {
         const PROTO_PATH: &str = "super";
 
         let output_filename = format!("{}.tonic.rs", request.proto_package_name());
@@ -74,21 +76,25 @@ impl TonicGenerator {
         if services.is_empty() {
             None
         } else {
-            let insertion = request.append_to_file(|buf| {
-                buf.push_str("include!(\"");
-                buf.push_str(&output_filename);
-                buf.push_str("\");\n");
-            })?;
+            let mut res = Vec::with_capacity(2);
 
             let file = syn::parse2(services).expect("valid rust file");
 
-            let data = File {
+            if self.insert_include {
+                res.push(request.append_to_file(|buf| {
+                    buf.push_str("include!(\"");
+                    buf.push_str(&output_filename);
+                    buf.push_str("\");\n");
+                })?);
+            }
+
+            res.push(File {
                 name: Some(output_filename),
                 content: Some(format!("// @generated\n{}", prettyplease::unparse(&file))),
                 ..File::default()
-            };
+            });
 
-            Some([data, insertion])
+            Some(res)
         }
     }
 

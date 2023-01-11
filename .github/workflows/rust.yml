@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - trying
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --all -- --check
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --no-fail-fast --all-features --locked
+      - run: cargo test --all-features --locked --doc
+
+  binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v3
+        with:
+          name: binary-release
+          path: |
+            target/release/protoc-gen-prost
+            target/release/protoc-gen-prost-crate
+            target/release/protoc-gen-prost-serde
+            target/release/protoc-gen-tonic
+
+  vet:
+    name: Vet Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-vet
+      - run: cargo vet --locked
+
+  greeter:
+    name: Greeter Example
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+        with:
+          name: binary-release
+          path: bin
+      - name: Mark as executable
+        run: chmod +x bin/*
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protobuf compiler and protobuf resources
+        run: sudo apt install protobuf-compiler libprotobuf-dev
+      - name: Generate greeter
+        run: |
+          export PATH=$GITHUB_WORKSPACE/bin:$PATH
+          buf generate -v --debug
+        working-directory: proto
+      - name: Build greeter
+        run: |
+          export CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target
+          cargo build
+          cargo build --features proto_full
+        working-directory: proto/gen
+
+  build-with-buf:
+    name: Build with Buf Example
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+        with:
+          name: binary-release
+          path: bin
+      - name: Mark as executable
+        run: chmod +x bin/*
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protobuf compiler and protobuf resources
+        run: sudo apt install protobuf-compiler libprotobuf-dev
+      - name: Generate example
+        run: |
+          export PATH=$GITHUB_WORKSPACE/bin:$PATH
+          buf generate -v --debug
+        working-directory: example/build-with-buf
+      - name: Build example
+        run: |
+          export CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target
+          cargo build --locked
+          cargo build --locked --no-default-features
+        working-directory: example/build-with-buf

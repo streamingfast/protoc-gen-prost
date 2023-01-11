@@ -1,16 +1,13 @@
 #![doc = include_str!("../README.md")]
 
-use self::generator::{CargoCrateGenerator, IncludeFileGenerator};
-use once_cell::sync::Lazy;
+use std::{rc::Rc, str};
+
 use prost::Message;
-
 use prost_types::compiler::CodeGeneratorRequest;
+use protoc_gen_prost::{Generator, InvalidParameter, ModuleRequestSet, Param, Params, Result};
 
-use protoc_gen_prost::{Generator, ModuleRequestSet, Result};
-
+use self::generator::{CargoCrateGenerator, IncludeFileGenerator};
 use crate::generator::FeaturesGenerator;
-use std::rc::Rc;
-use std::{fmt, str};
 
 mod generator;
 
@@ -31,6 +28,7 @@ pub fn execute(raw_request: &[u8]) -> Result {
     } else {
         params.include_file.as_deref().unwrap_or("mod.rs")
     };
+    let package_separator = params.package_separator.as_deref().unwrap_or("-");
 
     let limiter = Rc::new(params.only_include);
 
@@ -39,8 +37,8 @@ pub fn execute(raw_request: &[u8]) -> Result {
         .gen_crate
         .as_ref()
         .map(|o| CargoCrateGenerator::new(o.as_deref()));
-    let features_generator =
-        (!params.no_features).then(|| FeaturesGenerator::new(include_filename, limiter.clone()));
+    let features_generator = (!params.no_features)
+        .then(|| FeaturesGenerator::new(include_filename, package_separator, limiter.clone()));
 
     let files = include_file_generator
         .chain(cargo_crate_generator)
@@ -69,73 +67,72 @@ struct Parameters {
 
     /// Limit generation of includes to packages in this list
     only_include: PackageLimiter,
-}
 
-static PARAMETER: Lazy<regex::Regex> = Lazy::new(|| {
-    regex::Regex::new(
-        r"(?:(?P<param>[^,=]+)(?:=(?P<key>[^,=]+)(?:=(?P<value>(?:[^,=\\]|\\,|\\)+))?)?)",
-    )
-    .unwrap()
-});
+    /// Replace the `.` separator in package names to this character for cargo feature flags.
+    /// Defaults to `-` for compatibility with crates.io (see
+    /// [the documentation](https://doc.rust-lang.org/cargo/reference/features.html#the-features-section)
+    /// for more details).
+    ///
+    /// It is recommended to use `-` or `+` as a separator to be both compatible with crates.io and
+    /// avoid any conflict between pacakges with similar names (such as `foo.bar` and `foo_bar`).
+    ///
+    /// Allowed characters are `-`, `+`, `_`, `.`.
+    package_separator: Option<String>,
+}
 
 impl str::FromStr for Parameters {
     type Err = InvalidParameter;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut ret_val = Self::default();
-        for capture in PARAMETER.captures_iter(s) {
-            let param = capture
-                .get(1)
-                .expect("any captured group will at least have the param name")
-                .as_str()
-                .trim();
-
-            let key = capture.get(2).map(|m| m.as_str());
-            let value = capture.get(3).map(|m| m.as_str());
-
-            match (param, key, value) {
-                ("default_package_filename", value, None) => {
-                    ret_val.default_package_filename = value.map(ToOwned::to_owned)
+        for param in Params::from_protoc_plugin_opts(s)? {
+            match param {
+                Param::Parameter {
+                    param: "default_package_filename",
                 }
-                ("include_file", Some(filename), None) => {
-                    ret_val.include_file = Some(filename.to_owned())
-                }
-                ("only_include", Some(package), None) => {
+                | Param::Value {
+                    param: "default_package_filename",
+                    ..
+                } => ret_val.default_package_filename = param.value().map(|v| v.into_owned()),
+                Param::Value {
+                    param: "include_file",
+                    value: filename,
+                } => ret_val.include_file = Some(filename.to_owned()),
+                Param::Value {
+                    param: "only_include",
+                    value: package,
+                } => {
                     if ret_val.only_include.push(package.to_owned()).is_err() {
-                        return Err(InvalidParameter(format!(
-                            "proto paths must begin with `.`: {}",
-                            capture.get(0).unwrap().as_str()
+                        return Err(InvalidParameter::new(format!(
+                            "proto paths must begin with `.`: only_include={package}",
                         )));
                     }
                 }
-                ("gen_crate", template, None) => {
-                    ret_val.gen_crate = Some(template.map(ToOwned::to_owned))
+                Param::Parameter { param: "gen_crate" }
+                | Param::Value {
+                    param: "gen_crate", ..
+                } => ret_val.gen_crate = Some(param.value().map(|t| t.into_owned())),
+                Param::Parameter {
+                    param: "no_features",
                 }
-                ("no_features", Some("true") | None, None) => ret_val.no_features = true,
-                ("no_features", Some("false"), None) => (),
-                _ => {
-                    return Err(InvalidParameter(
-                        capture.get(0).unwrap().as_str().to_string(),
-                    ))
-                }
+                | Param::Value {
+                    param: "no_features",
+                    value: "true",
+                } => ret_val.no_features = true,
+                Param::Value {
+                    param: "no_features",
+                    value: "false",
+                } => (),
+                Param::Value {
+                    param: "package_separator",
+                    value: value @ ("." | "-" | "+" | "_"),
+                } => ret_val.package_separator = Some(value.to_string()),
+                _ => return Err(InvalidParameter::from(param)),
             }
         }
 
         Ok(ret_val)
     }
 }
-
-/// An invalid parameter
-#[derive(Debug)]
-struct InvalidParameter(String);
-
-impl fmt::Display for InvalidParameter {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("invalid parameter: ")?;
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for InvalidParameter {}
 
 #[derive(Debug, Default)]
 struct PackageLimiter {
@@ -159,11 +156,7 @@ impl PackageLimiter {
         if self.include_prefixes.is_empty() {
             true
         } else {
-            let package = if package.starts_with('.') {
-                &package[1..]
-            } else {
-                package
-            };
+            let package = package.strip_prefix('.').unwrap_or(package);
 
             self.include_prefixes
                 .iter()

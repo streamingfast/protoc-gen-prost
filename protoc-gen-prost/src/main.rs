@@ -1,13 +1,14 @@
-use prost::Message;
-use protoc_gen_prost::GeneratorResultExt;
 use std::{
     env,
     io::{self, Read, Write},
     process::exit,
 };
 
+use prost::Message;
+use protoc_gen_prost::GeneratorResultExt;
+
 fn main() -> io::Result<()> {
-    if let Some(_) = env::args().find(|x| x == "--version") {
+    if env::args().any(|x| x == "--version") {
         println!(env!("CARGO_PKG_VERSION"));
         exit(0);
     }
